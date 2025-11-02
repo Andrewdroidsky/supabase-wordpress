@@ -58,7 +58,7 @@ supabase-bridge-v*.zip
 
 # Legacy directories (NOT Init/ - it's critical!)
 archive/
-docs/
+# docs/  ← REMOVED - now we have modular documentation!
 
 # WordPress debugging
 wp-content/debug.log

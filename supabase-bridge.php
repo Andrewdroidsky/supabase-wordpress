@@ -31,11 +31,12 @@ function sb_add_security_headers() {
     // This prevents conflicts with MemberPress/Alpine.js which require 'unsafe-eval'
     if (!is_admin() && !is_user_logged_in()) {
       $csp = "default-src 'self'; " .
-             "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; " .
+             "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net blob:; " .
              "connect-src 'self' https://*.supabase.co; " .
              "style-src 'self' 'unsafe-inline'; " .
              "img-src 'self' data: https:; " .
              "font-src 'self' data:; " .
+             "worker-src 'self' blob:; " .
              "frame-ancestors 'self';";
       header("Content-Security-Policy: " . $csp);
     }
@@ -508,6 +509,24 @@ function sb_log_registration_to_supabase($user_email, $supabase_user_id, $regist
       }
     }
 
+    // ✅ CHECK: Skip if user already logged (prevents duplicate entries on re-login)
+    $check_endpoint = rtrim($url, '/') . '/rest/v1/wp_user_registrations?user_id=eq.' . $validated_user_id . '&select=id&limit=1';
+    $check_response = wp_remote_get($check_endpoint, [
+      'headers' => [
+        'apikey' => $anon_key,
+        'Authorization' => 'Bearer ' . $anon_key,
+      ],
+      'timeout' => 3,
+    ]);
+
+    if (!is_wp_error($check_response)) {
+      $existing = json_decode(wp_remote_retrieve_body($check_response), true);
+      if (is_array($existing) && !empty($existing)) {
+        // Record already exists - skip silently
+        return true;
+      }
+    }
+
     // Endpoint for wp_user_registrations table
     $endpoint = rtrim($url, '/') . '/rest/v1/wp_user_registrations';
 
@@ -630,11 +649,46 @@ add_filter('the_content', function($content) {
   return $content;
 }, 9999); // Максимальный приоритет - выполняется последним
 
+// === FIX: Декодируем HTML entities в JavaScript коде (исправляем &#038; → &) ===
+add_filter('the_content', function($content) {
+  // Если на странице есть Supabase auth форма
+  if (strpos($content, 'sb-auth-wrapper') !== false || strpos($content, 'SUPABASE_CFG') !== false) {
+    // Декодируем HTML entities внутри <script> тегов
+    $content = preg_replace_callback(
+      '/<script\b[^>]*>(.*?)<\/script>/is',
+      function($matches) {
+        // Декодируем HTML entities в JavaScript коде
+        return '<script' . substr($matches[0], 7, strpos($matches[0], '>') - 7) . '>' .
+               html_entity_decode($matches[1], ENT_QUOTES | ENT_HTML5, 'UTF-8') .
+               '</script>';
+      },
+      $content
+    );
+  }
+  return $content;
+}, 999999); // Самый последний приоритет
+
 // === Добавляем shortcode в whitelist ===
 add_filter('no_texturize_shortcodes', function($shortcodes) {
   $shortcodes[] = 'supabase_auth_form';
   return $shortcodes;
 });
+
+// === Отключаем WordPress фильтры для страниц с Supabase формой ===
+add_action('template_redirect', function() {
+  global $post;
+
+  // Проверяем есть ли шорткод на странице
+  if (is_a($post, 'WP_Post') && has_shortcode($post->post_content, 'supabase_auth_form')) {
+    // Отключаем wptexturize который меняет && на &#038;&#038;
+    remove_filter('the_content', 'wptexturize');
+    remove_filter('the_excerpt', 'wptexturize');
+
+    // Отключаем convert_chars который тоже может менять символы
+    remove_filter('the_content', 'convert_chars');
+    remove_filter('the_excerpt', 'convert_chars');
+  }
+}, 1);
 
 // Подключим supabase-js и прокинем public-конфиг (чтоб не хардкодить в HTML)
 add_action('wp_enqueue_scripts', function () {
@@ -660,6 +714,15 @@ add_action('wp_enqueue_scripts', function () {
     'thankYouUrl' => sb_get_thankyou_url(),     // Thank You Page URL from Settings (global fallback)
     'registrationPairs' => $js_pairs,           // Phase 4: Page-specific pairs
   ]) . ';', 'before');
+
+  // === Register auth-form.js (JavaScript code separate from HTML to avoid WordPress filters) ===
+  wp_enqueue_script(
+    'supabase-auth-form',
+    plugin_dir_url(__FILE__) . 'auth-form.js',
+    ['supabase-js'], // Depends on supabase-js
+    filemtime(plugin_dir_path(__FILE__) . 'auth-form.js'), // Version = file modification time for cache busting
+    true // Load in footer
+  );
 });
 
 // === Elementor CSP Compatibility ===
@@ -741,45 +804,16 @@ function sb_handle_callback(\WP_REST_Request $req) {
   }
 
   $issuer = "https://{$projectRef}.supabase.co/auth/v1";
-  $jwks  = "{$issuer}/.well-known/jwks.json";
+  $jwtSecret = sb_cfg('JWT_SECRET', '');
+
+  if (!$jwtSecret) {
+    error_log('Supabase Bridge: JWT_SECRET not configured');
+    return new \WP_Error('cfg','JWT Secret not configured. Add it in plugin settings.',['status'=>500]);
+  }
 
   try {
-    // 1) Забираем JWKS (with caching for performance)
-    $cache_key = 'sb_jwks_' . md5($jwks);
-    $keys = get_transient($cache_key);
-
-    if ($keys === false) {
-      // Cache miss - fetch from Supabase
-      $resp = wp_remote_get($jwks, [
-        'timeout' => 5,
-        'sslverify' => true, // Ensure SSL verification
-        'user-agent' => 'Supabase-Bridge-WordPress/0.3.3'
-      ]);
-
-      if (is_wp_error($resp)) {
-        error_log('Supabase Bridge: JWKS fetch failed - ' . $resp->get_error_message());
-        throw new Exception('Authentication service unavailable');
-      }
-
-      $status_code = wp_remote_retrieve_response_code($resp);
-      if ($status_code !== 200) {
-        error_log('Supabase Bridge: JWKS fetch returned status ' . $status_code);
-        throw new Exception('Authentication service unavailable');
-      }
-
-      $keys = json_decode(wp_remote_retrieve_body($resp), true);
-      if (!isset($keys['keys']) || !is_array($keys['keys'])) {
-        error_log('Supabase Bridge: Invalid JWKS format');
-        throw new Exception('Authentication service error');
-      }
-
-      // Cache for 1 hour (3600 seconds)
-      set_transient($cache_key, $keys, 3600);
-    }
-
-    // 2) Проверяем JWT (RS256) и клеймы
-    $publicKeys = \Firebase\JWT\JWK::parseKeySet($keys);
-    $decoded = \Firebase\JWT\JWT::decode($jwt, $publicKeys);
+    // Verify JWT using HS256 with JWT Secret
+    $decoded = \Firebase\JWT\JWT::decode($jwt, new \Firebase\JWT\Key($jwtSecret, 'HS256'));
     $claims = (array)$decoded;
 
     // Validate issuer
@@ -927,16 +961,6 @@ function sb_handle_callback(\WP_REST_Request $req) {
           delete_transient($lock_key);
 
           error_log('Supabase Bridge: User created successfully - User ID: ' . $uid);
-
-          // === Phase 6: Log registration to Supabase (non-blocking) ===
-          // Extract registration URL from referer
-          if ($referer) {
-            $registration_url = parse_url($referer, PHP_URL_PATH);
-            if ($registration_url) {
-              sb_log_registration_to_supabase($email, $supabase_user_id, $registration_url);
-              // Note: We don't check return value - logging is non-critical
-            }
-          }
         }
       }
     }
@@ -944,6 +968,17 @@ function sb_handle_callback(\WP_REST_Request $req) {
     // Update Supabase user ID for user (handles both new and existing users)
     if ($user && $user->ID) {
       update_user_meta($user->ID, 'supabase_user_id', $supabase_user_id);
+    }
+
+    // === Phase 6: Log registration to Supabase (non-blocking) ===
+    // MOVED OUTSIDE user creation block - works for ALL authentications (new + existing users)
+    // Extract registration URL from referer
+    if ($referer && $user && $user->ID) {
+      $registration_url = parse_url($referer, PHP_URL_PATH);
+      if ($registration_url) {
+        sb_log_registration_to_supabase($email, $supabase_user_id, $registration_url);
+        // Note: We don't check return value - logging is non-critical
+      }
     }
 
     // 4) Логиним в WP
@@ -1049,6 +1084,7 @@ function sb_render_setup_page() {
     $url = sanitize_text_field($_POST['sb_supabase_url'] ?? '');
     $anon_key = sanitize_text_field($_POST['sb_supabase_anon_key'] ?? '');
     $service_key = sanitize_text_field($_POST['sb_supabase_service_key'] ?? '');
+    $jwt_secret = sanitize_text_field($_POST['sb_jwt_secret'] ?? '');
 
     $credentials_updated = false;
 
@@ -1062,6 +1098,10 @@ function sb_render_setup_page() {
     }
     if (!empty($service_key)) {
       update_option('sb_supabase_service_key', sb_encrypt($service_key));
+      $credentials_updated = true;
+    }
+    if (!empty($jwt_secret)) {
+      update_option('sb_jwt_secret', sb_encrypt($jwt_secret));
       $credentials_updated = true;
     }
 
@@ -1166,6 +1206,26 @@ function sb_render_setup_page() {
               <p class="description">
                 <strong>⚠️ NEVER expose this key to frontend!</strong> Used for server-side operations (sync, logging).
                 Bypasses RLS policies. Example: <code>eyJhbGciOiJIUzI1...</code>
+              </p>
+            </td>
+          </tr>
+
+          <tr>
+            <th scope="row">
+              <label for="sb_jwt_secret">JWT Secret 🔑</label>
+            </th>
+            <td>
+              <input
+                type="password"
+                name="sb_jwt_secret"
+                id="sb_jwt_secret"
+                value="<?php echo esc_attr(sb_cfg('JWT_SECRET', '')); ?>"
+                class="large-text"
+                placeholder="your-jwt-secret-key..."
+              >
+              <p class="description">
+                <strong>⚠️ NEVER expose this secret to frontend!</strong> Used to verify JWT tokens from Supabase Auth.
+                Find in Supabase Dashboard → Settings → API → JWT Settings → JWT Secret
               </p>
             </td>
           </tr>
